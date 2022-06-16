@@ -1,0 +1,26 @@
+# Control Spot to go in a specific position, such as:
+# sitting, standing, looking up/down, custom
+
+# Type of position to set
+uint8 pose_type
+
+# Existent position
+uint8 STAND=1       # /spot/stand
+uint8 SIT=2         # /spot/sit
+uint8 LOOK_UP=3     # Tilt torso up, ex: look at a door
+uint8 LOOK_DOWN=4   # Tilt torso down, ex: look at object on ground
+uint8 HEAD_TILT=5   # Head tilt to right, ex: like a dog
+
+uint8 CUSTOM=6      # Custom pose, specify euler angles
+float64 euler_x
+float64 euler_y
+float64 euler_z
+float64 position_hold_time  # Tie to hold the position for
+
+# Time options for holding position
+float64 POSITION_HOLD_TIME_DEFAULT=-1.0 # Reasonable Time
+float64 POSE_HOLD_TIME_INF=-2.0         # Hold until told to do otherwise
+
+---
+bool success
+string message

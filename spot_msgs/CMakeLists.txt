@@ -40,12 +40,20 @@ add_service_files(
   SetLocomotion.srv
   SetVelocity.srv
   ClearBehaviorFault.srv
+  ArmJointMovement.srv
+  ConstrainedArmJointMovement.srv
+  GripperAngleMove.srv
+  ArmForceTrajectory.srv
+  HandPose.srv
+  SpotPosition.srv
+  OpenDoor.srv
 )
 
 add_action_files(
   FILES
   NavigateTo.action
   Trajectory.action
+  OpenDoor.action
 )
 
 generate_messages(

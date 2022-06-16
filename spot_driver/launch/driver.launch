@@ -1,6 +1,6 @@
 <launch>
-  <arg name="username" default="dummyusername" />
-  <arg name="password" default="dummypassword" />
+  <arg name="username" default="ros" />
+  <arg name="password" default="spottherobot" />
   <arg name="hostname" default="192.168.50.3" />
   <arg name="estop_timeout" default="9.0"/>
 
@@ -22,5 +22,7 @@
     <rosparam command="load" file="$(find spot_driver)/config/twist_mux.yaml" />
     <remap from="cmd_vel_out" to="spot/cmd_vel"/>
   </node>
+
+  <node pkg="tf" type="static_transform_publisher" name="gripper_goal" args="0.04 0 0.1 1 0 0 0 /object /gripper_goal 100"/>
 
 </launch>

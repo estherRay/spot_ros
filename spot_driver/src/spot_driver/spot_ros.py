@@ -1,6 +1,8 @@
 import rospy
+import time
+import math
 
-from std_srvs.srv import Trigger, TriggerResponse, SetBool, SetBoolResponse
+from std_srvs.srv import Trigger, TriggerResponse, SetBool, SetBoolResponse, Empty
 from std_msgs.msg import Bool
 from tf2_msgs.msg import TFMessage
 from geometry_msgs.msg import TransformStamped
@@ -8,6 +10,9 @@ from sensor_msgs.msg import Image, CameraInfo
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import TwistWithCovarianceStamped, Twist, Pose
 from nav_msgs.msg import Odometry
+
+from bosdyn.client.frame_helpers import get_a_tform_b, get_vision_tform_body, BODY_FRAME_NAME, VISION_FRAME_NAME
+import tf2_ros
 
 from bosdyn.api.spot import robot_command_pb2 as spot_command_pb2
 from bosdyn.api import geometry_pb2, trajectory_pb2
@@ -35,6 +40,16 @@ from spot_msgs.srv import ListGraph, ListGraphResponse
 from spot_msgs.srv import SetLocomotion, SetLocomotionResponse
 from spot_msgs.srv import ClearBehaviorFault, ClearBehaviorFaultResponse
 from spot_msgs.srv import SetVelocity, SetVelocityResponse
+from spot_msgs.srv import ArmJointMovement, ArmJointMovementResponse, ArmJointMovementRequest
+from spot_msgs.srv import GripperAngleMove, GripperAngleMoveResponse, GripperAngleMoveRequest
+from spot_msgs.srv import ArmForceTrajectory, ArmForceTrajectoryResponse, ArmForceTrajectoryRequest
+from spot_msgs.srv import HandPose, HandPoseResponse, HandPoseRequest
+from spot_msgs.srv import SpotPosition, SpotPositionResponse, SpotPositionRequest
+from geometry_msgs.msg import Point
+from my_grasping.msg import PixelPose
+from my_grasping.msg import PixelList
+from darknet_ros_msgs.msg import BoundingBoxes
+
 
 from .ros_helpers import *
 from .spot_wrapper import SpotWrapper
@@ -49,6 +64,8 @@ class SpotROS():
     def __init__(self):
         self.spot_wrapper = None
 
+        self.global_pixel = None
+
         self.callbacks = {}
         """Dictionary listing what callback to use for what data task"""
         self.callbacks["robot_state"] = self.RobotStateCB
@@ -57,6 +74,7 @@ class SpotROS():
         self.callbacks["front_image"] = self.FrontImageCB
         self.callbacks["side_image"] = self.SideImageCB
         self.callbacks["rear_image"] = self.RearImageCB
+        self.callbacks["hand_image"] = self.HandImageCB
 
     def RobotStateCB(self, results):
         """Callback for when the Spot Wrapper gets new robot state data.
@@ -234,6 +252,32 @@ class SpotROS():
             self.populate_camera_static_transforms(data[0])
             self.populate_camera_static_transforms(data[1])
 
+    def HandImageCB(self, results):
+        """Callback for when the Spot Wrapper gets new hand image data.
+
+        Args:
+            results: FutureWrapper object of AsyncPeriodicQuery callback
+        """
+        data = self.spot_wrapper.hand_images
+        if data:
+            mage_msg0, camera_info_msg0 = getImageMsg(data[0], self.spot_wrapper)
+            self.hand_image_mono_pub.publish(mage_msg0)
+            self.hand_image_mono_info_pub.publish(camera_info_msg0)
+            mage_msg1, camera_info_msg1 = getImageMsg(data[1], self.spot_wrapper)
+            self.hand_depth_pub.publish(mage_msg1)
+            self.hand_depth_info_pub.publish(camera_info_msg1)
+            image_msg2, camera_info_msg2 = getImageMsg(data[2], self.spot_wrapper)
+            self.hand_image_color_pub.publish(image_msg2)
+            self.hand_image_color_info_pub.publish(camera_info_msg2)
+            image_msg3, camera_info_msg3 = getImageMsg(data[3], self.spot_wrapper)
+            self.hand_depth_in_hand_color_pub.publish(image_msg3)
+            self.hand_depth_in_color_info_pub.publish(camera_info_msg3)
+
+            self.populate_camera_static_transforms(data[0])
+            self.populate_camera_static_transforms(data[1])
+            self.populate_camera_static_transforms(data[2])
+            self.populate_camera_static_transforms(data[3])
+
     def handle_claim(self, req):
         """ROS service handler for the claim service"""
         resp = self.spot_wrapper.claim()
@@ -399,7 +443,7 @@ class SpotROS():
     def cmdVelCallback(self, data):
         """Callback for cmd_vel command"""
         self.spot_wrapper.velocity_cmd(data.linear.x, data.linear.y, data.angular.z)
-
+    
     def bodyPoseCallback(self, data):
         """Callback for cmd_vel command"""
         q = Quaternion()
@@ -416,7 +460,7 @@ class SpotROS():
         mobility_params = self.spot_wrapper.get_mobility_params()
         mobility_params.body_control.CopyFrom(body_control)
         self.spot_wrapper.set_mobility_params(mobility_params)
-
+    
     def handle_list_graph(self, upload_path):
         """ROS service handler for listing graph_nav waypoint_ids"""
         resp = self.spot_wrapper.list_graph(upload_path)
@@ -448,7 +492,7 @@ class SpotROS():
         if resp[0]:
             self.navigate_as.set_succeeded(NavigateToResult(resp[0], resp[1]))
         else:
-            self.navigate_as.set_aborted(NavigateToResult(resp[0], resp[1]))
+            self.navigate_as.set_aborted(NavigateToResult(resp[0], resp[1]))    
 
     def populate_camera_static_transforms(self, image_data):
         """Check data received from one of the image tasks and use the transform snapshot to extract the camera frame
@@ -480,6 +524,145 @@ class SpotROS():
             self.camera_static_transforms.append(static_tf)
             self.camera_static_transform_broadcaster.sendTransform(self.camera_static_transforms)
 
+    def handle_spot_position(self, req:SpotPositionRequest):
+        """This is for Spot to hold a specific position for a certain amount of time"""
+        #Request 1: Stand
+        #Request 2: Sit
+        #Request 3: Look Up position
+        #Request 4: Look Down position
+        #Request 6: Custom. Need to give euler x, y, z 
+
+        position_spot = {
+            "euler_x" : 0.0,
+            "euler_y" : 0.0,
+            "euler_z" : 0.0
+        }
+        if req.pose_type == req.CUSTOM:
+            position_spot['euler_x'] = req.euler_x
+            position_spot['euler_y'] = req.euler_y
+            position_spot['euler_z'] = req.euler_z
+        if req.pose_type == req.LOOK_UP:
+            position_spot['euler_x'] = 0
+            position_spot['euler_y'] = -1 * math.pi / 6.0
+            position_spot['euler_z'] = 0
+        if req.pose_type == req.LOOK_DOWN:
+            position_spot['euler_x'] = 0
+            position_spot['euler_y'] = 1 * math.pi / 6.0
+            position_spot['euler_z'] = 0
+        if req.pose_type == req.SIT:
+            resp = self.handle_sit(None)
+            return SpotPositionResponse(resp.success, resp.message)
+        if req.pose_type == req.STAND:
+            resp = self.handle_stand(None)
+            return SpotPositionResponse(resp.success, resp.message)
+
+        end_time = 0
+        if req.position_hold_time >= 0:
+            end_time = req.position_hold_time
+        else:
+            if req.position_hold_time == req.POSE_HOLD_TIME_INF:
+                end_time = -1   # any negative value is hold until told so
+            if req.position_hold_time == req.POSE_HOLD_TIME_DEFAULT:
+                end_time = 10
+        try:
+            #ropsy.loginfo("Trying to achieve position {} for {}".format(position_spot, end_time))
+            #Give the information to the wrapper
+            self.spot_wrapper.spot_position(position_spot['euler_x'], position_spot['euler_y'], position_spot['euler_z'], timeout_sec=end_time)
+            return SpotPositionResponse(True, 'Success')
+        except Exception as e:
+            return SpotPositionResponse(False, 'Error:{}'.format(e))
+        
+    
+    # Arm functions ##################################################
+    def handle_arm_stow(self, srv_data):
+        """ROS service handler to command the arm to stow, home position """
+        resp = self.spot_wrapper.arm_stow()
+        return TriggerResponse(resp[0], resp[1])
+
+    def handle_arm_unstow(self, srv_data):
+        """ROS service handler to command the arm to unstow, joints are all zeros"""
+        resp = self.spot_wrapper.arm_unstow()
+        return TriggerResponse(resp[0], resp[1])
+
+    def handle_arm_joint_move(self, srv_data: ArmJointMovementRequest):
+        """ROS service handler to send joint movement to the arm to execute"""        
+        resp = self.spot_wrapper.arm_joint_move(joint_targets = srv_data.joint_target)
+        return ArmJointMovementResponse(resp[0], resp[1])
+
+    def handle_force_trajectory(self, srv_data: ArmForceTrajectoryRequest):
+        """ROS service handler to send a force trajectory up or down a vertical force"""
+        resp = self.spot_wrapper.force_trajectory(forces_torques = srv_data.force_torque)
+        return ArmForceTrajectoryResponse(resp[0], resp[1])
+    
+    def handle_gripper_open(self, srv_data):
+        """ROS service handler to open the gripper"""
+        resp = self.spot_wrapper.gripper_open()
+        return TriggerResponse(resp[0], resp[1])
+
+    def handle_gripper_close(self, srv_data):
+        """ROS service handler to close the gripper"""
+        resp = self.spot_wrapper.gripper_close()
+        return TriggerResponse(resp[0], resp[1])
+
+    def handle_gripper_angle_open(self, srv_data: GripperAngleMoveRequest):
+        """ROS service handler to open the gripper at an angle"""
+        resp = self.spot_wrapper.gripper_angle_open(gripper_ang = srv_data.gripper_angle)
+        return GripperAngleMoveResponse(resp[0], resp[1])
+
+    def handle_arm_carry(self, srv_data):
+        """ROS service handler to put arm in carry mode"""
+        resp = self.spot_wrapper.arm_carry()
+        return TriggerResponse(resp[0], resp[1])
+
+    def handle_body_follow_arm(self, srv_data):
+        """ROS service to send a pose to the end effector"""
+        resp = self.spot_wrapper.body_follow_arm()
+        return TriggerResponse(resp[0], resp[1])
+    
+    def handle_hand_pose(self, srv_data: HandPoseRequest):
+        """ROS service to give a position to the gripper and move the Arm"""
+        resp = self.spot_wrapper.hand_pose(pose_points = srv_data.pose_point)
+        return HandPoseResponse(resp[0], resp[1])
+
+    def walk_to_obj_callback(self, obj_point):
+        """Callback for pixel points, object to walk"""
+        rospy.loginfo("Pixel for location to walk to: " + str(obj_point))
+        the_click = []
+        the_click.append(obj_point.pixel_pose[0]) #x
+        the_click.append(obj_point.pixel_pose[1]) #y
+        self.spot_wrapper.walk_to_object_image(object_point = the_click)
+
+    def grasp_obj_callback(self, obj_pixel):
+        """Callback for pixel points using Hand image"""
+        self.spot_wrapper.grasp_object_image(y_min=obj_pixel.ymin, x_min=obj_pixel.xmin, y_max=obj_pixel.ymax, x_max=obj_pixel.xmax)
+
+    def fetch_callback(self, fetch_info):
+        """Callback for grasping using DARKNET ROS. In this case, object to be picked up is a BOTTLE"""
+        # For each bounding box
+        # Check if it is a bottle to then send info to wrapper to pick it up
+        for i in fetch_info.bounding_boxes:            
+            the_class = i.Class         #fetch_info.bounding_boxes[0].Class
+            the_proba = i.probability   #fetch_info.bounding_boxes[0].probability
+            if the_class == "bottle" and the_proba > 0.75:
+                print(the_class + " " + str(the_proba))
+                # Find centre pixel of bounding box
+                result = self.find_centre_px(i.xmin, i.xmax, i.ymin, i.ymax)
+                self.spot_wrapper.fetch_obj(center_px=result, y_min=i.ymin, x_min=i.xmin, y_max=i.ymax, x_max=i.xmax)
+
+
+    def click_fetch_callback(self, fetch_box):
+        """Callback for fetch using click rectangle, for walk_to_obj.py, using Frontright image"""
+        result = self.find_centre_px(fetch_box.xmin, fetch_box.xmax, fetch_box.ymin, fetch_box.ymax)
+        self.spot_wrapper.fetch_obj(center_px=result, y_min=fetch_box.ymin, x_min=fetch_box.xmin, y_max=fetch_box.ymax, x_max=fetch_box.xmax)
+
+
+    def find_centre_px(self, x_min, x_max, y_min, y_max):
+        """Helper method to find the centre pixel of a bounding box"""
+        x = math.fabs(x_max - x_min) / 2.0 + x_min
+        y = math.fabs(y_max - y_min) / 2.0 + y_min
+        return (x, y)
+    ##################################################################
+    
     def shutdown(self):
         rospy.loginfo("Shutting down ROS driver for Spot")
         self.spot_wrapper.sit()
@@ -529,12 +712,19 @@ class SpotROS():
             self.frontright_image_pub = rospy.Publisher('camera/frontright/image', Image, queue_size=10)
             self.left_image_pub = rospy.Publisher('camera/left/image', Image, queue_size=10)
             self.right_image_pub = rospy.Publisher('camera/right/image', Image, queue_size=10)
+            self.hand_image_mono_pub = rospy.Publisher('camera/hand_mono/image', Image, queue_size=10)
+            self.hand_image_color_pub = rospy.Publisher('camera/hand_color/image', Image, queue_size=10)
+
             # Depth #
             self.back_depth_pub = rospy.Publisher('depth/back/image', Image, queue_size=10)
             self.frontleft_depth_pub = rospy.Publisher('depth/frontleft/image', Image, queue_size=10)
             self.frontright_depth_pub = rospy.Publisher('depth/frontright/image', Image, queue_size=10)
             self.left_depth_pub = rospy.Publisher('depth/left/image', Image, queue_size=10)
             self.right_depth_pub = rospy.Publisher('depth/right/image', Image, queue_size=10)
+            self.hand_depth_pub = rospy.Publisher('depth/hand/image', Image, queue_size=10)
+            self.hand_depth_in_hand_color_pub = rospy.Publisher('depth/hand/depth_in_color', Image, queue_size=10)
+            self.frontleft_depth_in_visual_pub = rospy.Publisher('depth/frontleft/depth_in_visual', Image, queue_size=10)
+            self.frontright_depth_in_visual_pub = rospy.Publisher('depth/frontright/depth_in_visual', Image, queue_size=10)
 
             # Image Camera Info #
             self.back_image_info_pub = rospy.Publisher('camera/back/camera_info', CameraInfo, queue_size=10)
@@ -542,12 +732,19 @@ class SpotROS():
             self.frontright_image_info_pub = rospy.Publisher('camera/frontright/camera_info', CameraInfo, queue_size=10)
             self.left_image_info_pub = rospy.Publisher('camera/left/camera_info', CameraInfo, queue_size=10)
             self.right_image_info_pub = rospy.Publisher('camera/right/camera_info', CameraInfo, queue_size=10)
+            self.hand_image_mono_info_pub = rospy.Publisher('camera/hand_mono/camera_info', CameraInfo, queue_size=10)
+            self.hand_image_color_info_pub = rospy.Publisher('camera/hand_color/camera_info', CameraInfo, queue_size=10)
+
             # Depth Camera Info #
             self.back_depth_info_pub = rospy.Publisher('depth/back/camera_info', CameraInfo, queue_size=10)
             self.frontleft_depth_info_pub = rospy.Publisher('depth/frontleft/camera_info', CameraInfo, queue_size=10)
             self.frontright_depth_info_pub = rospy.Publisher('depth/frontright/camera_info', CameraInfo, queue_size=10)
             self.left_depth_info_pub = rospy.Publisher('depth/left/camera_info', CameraInfo, queue_size=10)
             self.right_depth_info_pub = rospy.Publisher('depth/right/camera_info', CameraInfo, queue_size=10)
+            self.hand_depth_info_pub = rospy.Publisher('depth/hand/camera_info', CameraInfo, queue_size=10)
+            self.hand_depth_in_color_info_pub = rospy.Publisher('camera/hand/depth_in_color/camera_info', CameraInfo, queue_size=10)
+            self.frontleft_depth_in_visual_info_pub = rospy.Publisher('depth/frontleft/depth_in_visual/camera_info', CameraInfo, queue_size=10)
+            self.frontright_depth_in_visual_info_pub = rospy.Publisher('depth/frontright/depth_in_visual/camera_info', CameraInfo, queue_size=10)
 
             # Status Publishers #
             self.joint_state_pub = rospy.Publisher('joint_states', JointState, queue_size=10)
@@ -564,13 +761,24 @@ class SpotROS():
             self.battery_pub = rospy.Publisher('status/battery_states', BatteryStateArray, queue_size=10)
             self.behavior_faults_pub = rospy.Publisher('status/behavior_faults', BehaviorFaultState, queue_size=10)
             self.system_faults_pub = rospy.Publisher('status/system_faults', SystemFaultState, queue_size=10)
-
             self.feedback_pub = rospy.Publisher('status/feedback', Feedback, queue_size=10)
 
             self.mobility_params_pub = rospy.Publisher('status/mobility_params', MobilityParams, queue_size=10)
 
             rospy.Subscriber('cmd_vel', Twist, self.cmdVelCallback, queue_size = 1)
             rospy.Subscriber('body_pose', Pose, self.bodyPoseCallback, queue_size = 1)
+
+            """ Pick up object, not finished """
+            # Walk to an object in an image by giving one pixel
+            rospy.Subscriber('object_location', PixelPose, self.walk_to_obj_callback, queue_size=1)
+            # Pick up an object given by user by running object_to_grasp.py, by giving a bounding box
+            rospy.Subscriber('object_to_grasp', PixelList, self.grasp_obj_callback, queue_size=1)
+
+            """ For FETCH """
+            # Fetch using darknet_ros, automatic object_detection, after launching darknet_ros.launch
+            rospy.Subscriber('/darknet_ros/bounding_boxes', BoundingBoxes, self.fetch_callback, queue_size=10)
+            # Fetch using input from user after launching walk_to_obj.py
+            rospy.Subscriber('object_box', PixelList, self.click_fetch_callback, queue_size=10)
 
             rospy.Service("claim", Trigger, self.handle_claim)
             rospy.Service("release", Trigger, self.handle_release)
@@ -592,6 +800,41 @@ class SpotROS():
 
             rospy.Service("list_graph", ListGraph, self.handle_list_graph)
 
+            # Arm Services #########################################
+            # Stow the Arm
+            rospy.Service("arm_stow", Trigger, self.handle_arm_stow)
+
+            # Unstow the Arm
+            rospy.Service("arm_unstow", Trigger, self.handle_arm_unstow)
+
+            # Open the Gripper fully
+            rospy.Service("gripper_open", Trigger, self.handle_gripper_open)
+
+            # Close the Gripper fully
+            rospy.Service("gripper_close", Trigger, self.handle_gripper_close)
+
+            # Enable Carry mode as in SDK
+            rospy.Service("arm_carry", Trigger, self.handle_arm_carry)
+
+            # Open the Gripper at a Angle given by the user
+            rospy.Service("gripper_angle_open", GripperAngleMove, self.handle_gripper_angle_open)
+
+            # Move the Arm by giving an angle to Each Joint of the Arm
+            rospy.Service("arm_joint_move", ArmJointMovement, self.handle_arm_joint_move)
+
+            # Generate a Force Trajectory as possible in SDK
+            rospy.Service("force_trajectory", ArmForceTrajectory, self.handle_force_trajectory)
+
+            # Martina will Follow its Arm by first unstowing it
+            rospy.Service("body_follow_hand", Trigger, self.handle_body_follow_arm)
+
+            # Move the Arm by giving a Pose in space to the Gripper
+            rospy.Service("gripper_pose", HandPose, self.handle_hand_pose)
+
+            # Service for Spot to hold a specific position for a certain amount of time
+            rospy.Service("spot_position", SpotPosition, self.handle_spot_position) 
+            #########################################################
+
             self.navigate_as = actionlib.SimpleActionServer('navigate_to', NavigateToAction,
                                                             execute_cb = self.handle_navigate_to,
                                                             auto_start = False)
@@ -602,7 +845,7 @@ class SpotROS():
                                                                   auto_start=False)
             self.trajectory_server.start()
 
-            rospy.on_shutdown(self.shutdown)
+            rospy.on_shutdown(self.shutdown) 
 
             self.auto_claim = rospy.get_param('~auto_claim', False)
             self.auto_power_on = rospy.get_param('~auto_power_on', False)
@@ -654,4 +897,25 @@ class SpotROS():
                     rospy.logerr('Error:{}'.format(e))
                     pass
                 self.mobility_params_pub.publish(mobility_params_msg)
+
+                # Create TF from robot to the object to be picked up in Fetch
+                world_my_object = self.spot_wrapper.get_world_tfrom_object()
+                if world_my_object is not None:
+                    t = TransformStamped()
+                    t.header.stamp = rospy.Time.now()
+                    t.header.frame_id = "vision"
+                    t.child_frame_id = "object"
+                    t.transform.translation.x = world_my_object.position.x
+                    t.transform.translation.y = world_my_object.position.y
+                    t.transform.translation.z = world_my_object.position.z 
+                    t.transform.rotation.x = world_my_object.rotation.x
+                    t.transform.rotation.y = world_my_object.rotation.y
+                    t.transform.rotation.z = world_my_object.rotation.z
+                    t.transform.rotation.w = world_my_object.rotation.w
+                    # Get the list of all existing transforms 
+                    existing_transforms = [(transform.header.frame_id, transform.child_frame_id) for transform in self.camera_static_transforms]
+                    if not (t.header.frame_id, t.child_frame_id) in existing_transforms:
+                        # If the transform dosent exist add to the publisher
+                        self.camera_static_transforms.append(t)    
+
                 rate.sleep()

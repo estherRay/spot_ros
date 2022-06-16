@@ -1,18 +1,26 @@
 import time
 import math
+import sys
+from typing import List
+import numpy as np
+import statistics
+import rospy
 
 from bosdyn.client import create_standard_sdk, ResponseError, RpcError
+from bosdyn.client import robot_command
 from bosdyn.client.async_tasks import AsyncPeriodicQuery, AsyncTasks
 from bosdyn.geometry import EulerZXY
 
 from bosdyn.client.robot_state import RobotStateClient
-from bosdyn.client.robot_command import RobotCommandClient, RobotCommandBuilder
+from bosdyn.client.manipulation_api_client import ManipulationApiClient
+from bosdyn.api import manipulation_api_pb2
+from bosdyn.client.robot_command import RobotCommandClient, RobotCommandBuilder, blocking_stand
 from bosdyn.client.graph_nav import GraphNavClient
-from bosdyn.client.frame_helpers import get_odom_tform_body
+from bosdyn.client.frame_helpers import get_odom_tform_body, ODOM_FRAME_NAME
 from bosdyn.client.power import safe_power_off, PowerClient, power_on
 from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
 from bosdyn.client.image import ImageClient, build_image_request
-from bosdyn.api import image_pb2
+from bosdyn.api import estop_pb2, image_pb2
 from bosdyn.api.graph_nav import graph_nav_pb2
 from bosdyn.api.graph_nav import map_pb2
 from bosdyn.api.graph_nav import nav_pb2
@@ -23,9 +31,17 @@ from bosdyn.client import math_helpers
 from bosdyn.client.exceptions import InternalServerError
 
 from . import graph_nav_util
+from spot_driver.arm.arm_wrapper import ArmWrapper
 
+from bosdyn.api import arm_command_pb2
 import bosdyn.api.robot_state_pb2 as robot_state_proto
 from bosdyn.api import basic_command_pb2
+from bosdyn.api import synchronized_command_pb2
+from bosdyn.api import robot_command_pb2
+from bosdyn.api import geometry_pb2
+from bosdyn.api import trajectory_pb2
+from bosdyn.util import seconds_to_duration
+from google.protobuf.duration_pb2 import Duration
 from google.protobuf.timestamp_pb2 import Timestamp
 
 front_image_sources = ['frontleft_fisheye_image', 'frontright_fisheye_image', 'frontleft_depth', 'frontright_depth']
@@ -34,6 +50,9 @@ side_image_sources = ['left_fisheye_image', 'right_fisheye_image', 'left_depth',
 """List of image sources for side image periodic query"""
 rear_image_sources = ['back_fisheye_image', 'back_depth']
 """List of image sources for rear image periodic query"""
+hand_image_sources = ['hand_image', 'hand_depth', 'hand_color_image', 'hand_depth_in_hand_color_frame']
+"""List of image sources for hand image periodic query"""
+
 
 class AsyncRobotState(AsyncPeriodicQuery):
     """Class to get robot state at regular intervals.  get_robot_state_async query sent to the robot at every tick.  Callback registered to defined callback function.
@@ -141,13 +160,19 @@ class AsyncIdle(AsyncPeriodicQuery):
 
     def _start_query(self):
         if self._spot_wrapper._last_stand_command != None:
+            hold_position = False
+            if self._spot_wrapper._hold_position_time is not None and time.time() < self._spot_wrapper._hold_position_time:
+                hold_position = True
             try:
                 response = self._client.robot_command_feedback(self._spot_wrapper._last_stand_command)
                 self._spot_wrapper._is_sitting = False
                 if (response.feedback.synchronized_feedback.mobility_command_feedback.stand_feedback.status ==
                         basic_command_pb2.StandCommand.Feedback.STATUS_IS_STANDING):
+                    if hold_position:
+                        return
                     self._spot_wrapper._is_standing = True
                     self._spot_wrapper._last_stand_command = None
+                    self._hold_position_time = None
                 else:
                     self._spot_wrapper._is_standing = False
             except (ResponseError, RpcError) as e:
@@ -228,6 +253,8 @@ class SpotWrapper():
         self._last_trajectory_command = None
         self._last_trajectory_command_precise = None
         self._last_velocity_command_time = None
+        self._hold_position_time = None
+        self._get_world_tfrom_object = None
 
         self._front_image_requests = []
         for source in front_image_sources:
@@ -240,6 +267,10 @@ class SpotWrapper():
         self._rear_image_requests = []
         for source in rear_image_sources:
             self._rear_image_requests.append(build_image_request(source, image_format=image_pb2.Image.FORMAT_RAW))
+
+        self._hand_image_requests = []
+        for source in hand_image_sources:
+            self._hand_image_requests.append(build_image_request(source, image_format=image_pb2.Image.FORMAT_RAW))
 
         try:
             self._sdk = create_standard_sdk('ros_spot')
@@ -269,6 +300,8 @@ class SpotWrapper():
                 self._lease_wallet = self._lease_client.lease_wallet
                 self._image_client = self._robot.ensure_client(ImageClient.default_service_name)
                 self._estop_client = self._robot.ensure_client(EstopClient.default_service_name)
+                # Start Arm wrapper
+                self._arm = ArmWrapper(self._robot, self, self._logger)
             except Exception as e:
                 self._logger.error("Unable to create client service: %s", e)
                 self._valid = False
@@ -289,12 +322,13 @@ class SpotWrapper():
             self._front_image_task = AsyncImageService(self._image_client, self._logger, max(0.0, self._rates.get("front_image", 0.0)), self._callbacks.get("front_image", lambda:None), self._front_image_requests)
             self._side_image_task = AsyncImageService(self._image_client, self._logger, max(0.0, self._rates.get("side_image", 0.0)), self._callbacks.get("side_image", lambda:None), self._side_image_requests)
             self._rear_image_task = AsyncImageService(self._image_client, self._logger, max(0.0, self._rates.get("rear_image", 0.0)), self._callbacks.get("rear_image", lambda:None), self._rear_image_requests)
+            self._hand_image_task = AsyncImageService(self._image_client, self._logger, max(0.0, self._rates.get("hand_image", 0.0)), self._callbacks.get("hand_image", lambda:None), self._hand_image_requests)
             self._idle_task = AsyncIdle(self._robot_command_client, self._logger, 10.0, self)
 
             self._estop_endpoint = None
 
             self._async_tasks = AsyncTasks(
-                [self._robot_state_task, self._robot_metrics_task, self._lease_task, self._front_image_task, self._side_image_task, self._rear_image_task, self._idle_task])
+                [self._robot_state_task, self._robot_metrics_task, self._lease_task, self._front_image_task, self._side_image_task, self._rear_image_task, self._hand_image_task, self._idle_task])
 
             self._robot_id = None
             self._lease = None
@@ -343,6 +377,11 @@ class SpotWrapper():
     def rear_images(self):
         """Return latest proto from the _rear_image_task"""
         return self._rear_image_task.proto
+    
+    @property
+    def hand_images(self):
+        """Return latest proto from the _hand_image_task"""
+        return self._hand_image_task.proto
 
     @property
     def is_standing(self):
@@ -512,6 +551,8 @@ class SpotWrapper():
 
     def sit(self):
         """Stop the robot's motion and sit down if able."""
+        self.arm_stow() # Arm needs to be stowed before sitting!!
+        time.sleep(0.5)
         response = self._robot_command(RobotCommandBuilder.synchro_sit_command())
         self._last_sit_command = response[2]
         return response[0], response[1]
@@ -673,6 +714,940 @@ class SpotWrapper():
         resp = self._navigate_to([navigate_to])
 
         return resp
+    
+    def spot_position(self, euler_x, euler_y, euler_z, timeout_sec=0.0, monitor_command=True):
+        """If the e-stop is enabled, and the motor power is enabled, stand the robot up.
+            This is for Spot to hold a specific position for a certain amount of time"""
+        mobility_param = RobotCommandBuilder().mobility_params(footprint_R_body=EulerZXY(euler_z, euler_x, euler_y))
+        response = self._robot_command(RobotCommandBuilder.synchro_stand_command(params=mobility_param), end_time_secs=timeout_sec)
+        self._hold_position_time = time.time() + timeout_sec
+        if monitor_command:
+            self._last_stand_command = response[2]
+        return response[0], response[1]
+
+    # Arm ############################################
+    def ensure_arm_power_and_stand(self):
+        if not self._robot.has_arm():
+            return False, "Spot with an arm is required for this service"
+        
+        try:
+            self._logger.info("Spot is powering on within the timeout of 20 secs")
+            self._robot.power_on(timeout_sec=20)
+            assert self._robot.is_powered_on(), "Spot failed to power on"
+            self._logger.info("Spot is powered on")
+        except Exception as e:
+            return False, "Exception occured while Spot was trying to power on or stand"
+
+        if not self._is_standing:
+            robot_command.blocking_stand(command_client=self._robot_command_client, timeout_sec=10.0)
+            self._logger.info("Spot is standing")
+        else:
+            self._logger.info("Spot is already standing")
+
+        return True, "Spot has an arm, is powered on, and standing"
+
+    def arm_stow(self):
+        try:
+            success, msg = self.ensure_arm_power_and_stand()
+            if not success:
+                self._logger.info(msg)
+                return False, msg
+            else:
+                # Stow Arm
+                stow = RobotCommandBuilder.arm_stow_command()
+
+                # Command issue with RobotCommandClient
+                self._robot_command_client.robot_command(stow)
+                self._logger.info("Command stow issued")
+                time.sleep(2.0)
+
+        except Exception as e:
+            return False, "Exception occured while trying to stow"
+
+        return True, "Stow arm success"
+
+    def arm_unstow(self):
+        try:
+            success, msg = self.ensure_arm_power_and_stand()
+            if not success:
+                self._logger.info(msg)
+                return False, msg
+            else:                
+                # Unstow Arm
+                unstow = RobotCommandBuilder.arm_ready_command()
+
+                # Command issue with RobotCommandClient
+                self._robot_command_client.robot_command(unstow)
+                self._logger.info("Command unstow issued")
+                time.sleep(2.0)
+
+        except Exception as e:
+            return False, "Exception occured while trying to unstow"
+
+        return True, "Unstow arm success"
+
+    def arm_carry(self):
+        try:
+            success, msg = self.ensure_arm_power_and_stand()
+            if not success:
+                self._logger.info(msg)
+                return False, msg
+            else:
+                # Get arm in carry mode
+                carry = RobotCommandBuilder.arm_carry_command()
+                self._robot_command_client.robot_command(carry)
+                self._logger.info("Command carry issued")
+                time.sleep(1.0)
+        except Exception as e:
+            return False, "Exception occured while carry mode was issued"
+
+        return True, "Carry mode success"
+    
+    
+    def make_arm_trajectory_command(self, arm_joint_trajectory):
+        """ Helper function to create a RobotCommand from an ArmJointTrajectory. 
+            Copy from 'spot-sdk/python/examples/arm_joint_move/arm_joint_move.py' """
+
+        joint_move_command = arm_command_pb2.ArmJointMoveCommand.Request(trajectory=arm_joint_trajectory)
+        arm_command = arm_command_pb2.ArmCommand.Request(arm_joint_move_command=joint_move_command)
+        sync_arm = synchronized_command_pb2.SynchronizedCommand.Request(arm_command=arm_command)
+        arm_sync_robot_cmd = robot_command_pb2.RobotCommand(synchronized_command=sync_arm)
+        return RobotCommandBuilder.build_synchro_command(arm_sync_robot_cmd)
+
+    def arm_joint_move(self, joint_targets):
+        """Move the Arm by giving an angle for each joints of the arm"""
+        try:
+            success, msg = self.ensure_arm_power_and_stand()
+            if not success:
+                self._logger.info(msg)
+                return False, msg
+            else:
+                # Joint1: 0.0 arm points to the front. RANGE: 0.0 -> 5.75959 (positive: turn left, negative: turn right)
+                # Joint2: 0.0 arm points to the front. RANGE: 0.0 -> 3.66519)
+                # Joint3: 0.0 arm straight. RANGE: 0.0 -> 3.1415
+                # Joint4: 0.0 middle position. RANGE: -2.79253 -> 2.79253
+                # Joint5: 0.0 gripper points to the front. RANGE: -1.8326 -> 1.8326
+                # Joint6: 0.0 Moving finger on top of stationary finger. RANGE: -2.87979 -> 2.87979)
+
+                trajectory_point = RobotCommandBuilder.create_arm_joint_trajectory_point(
+                    joint_targets[0], joint_targets[1], joint_targets[2],
+                    joint_targets[3], joint_targets[4], joint_targets[5])
+                arm_joint_trajectory = arm_command_pb2.ArmJointTrajectory(points = [trajectory_point])
+                arm_command = self.make_arm_trajectory_command(arm_joint_trajectory)
+
+                # Send the request
+                cmd_id = self._robot_command_client.robot_command(arm_command)
+
+                # Query for feedback to determine how long it will take
+                feedback_resp = self._robot_command_client.robot_command_feedback(cmd_id)
+                joint_move_feedback = feedback_resp.feedback.synchronized_feedback.arm_command_feedback.arm_joint_move_feedback
+                time_to_goal : Duration = joint_move_feedback.time_to_goal
+                time_to_goal_in_seconds: float = time_to_goal.seconds + (float(time_to_goal.nanos) / float(10**9))
+                time.sleep(time_to_goal_in_seconds)
+                return True, "Spot Arm moved successfully"
+        
+        except Exception as e:
+            return False, "Exception occured during arm movement: " + str(e)
+
+    def force_trajectory(self, forces_torques):
+        try:
+            success, msg = self.ensure_arm_power_and_stand()
+            if not success:
+                self._logger.info(msg)
+                return False, msg
+            else:
+                # Unstow arm
+                unstow = RobotCommandBuilder.arm_ready_command()
+
+                # Send command via the RobotCommandClient
+                self._robot_command_client.robot_command(unstow)
+
+                self._logger.info("Unstow command issued.")
+                time.sleep(2.0)
+
+                # Demonstrate an example force trajectory by ramping up and down a vertical force over
+                # 10 seconds
+
+                f_x0 = forces_torques[0]  # Newtons
+                f_y0 = forces_torques[1]
+                f_z0 = forces_torques[2]
+
+                f_x1 = forces_torques[3]  # Newtons
+                f_y1 = forces_torques[4]
+                f_z1 = forces_torques[5]  # -10 push down
+
+                # We won't have any rotational torques
+                torque_x = forces_torques[6]
+                torque_y = forces_torques[7]
+                torque_z = forces_torques[8]
+
+                # Duration in seconds.
+                traj_duration = 5
+
+                # First point of trajectory
+                force_vector0 = geometry_pb2.Vec3(x=f_x0, y=f_y0, z=f_z0)
+                torque_vector0 = geometry_pb2.Vec3(x=torque_x, y=torque_y, z=torque_z)
+                
+                wrench0 = geometry_pb2.Wrench(force=force_vector0, torque=torque_vector0)
+                t0 = seconds_to_duration(0)
+                traj_point0 = trajectory_pb2.WrenchTrajectoryPoint(wrench=wrench0,
+                                                                time_since_reference=t0)
+                
+                # Second point on the trajectory
+                force_vector1 = geometry_pb2.Vec3(x=f_x1, y=f_y1, z=f_z1)
+                torque_vector1 = geometry_pb2.Vec3(x=torque_x, y=torque_y, z=torque_z)
+
+                wrench1 = geometry_pb2.Wrench(force=force_vector1, torque=torque_vector1)
+                t1 = seconds_to_duration(traj_duration)
+                traj_point1 = trajectory_pb2.WrenchTrajectoryPoint(wrench=wrench1,
+                                                                time_since_reference=t1)
+
+                # Build the trajectory
+                self._logger.info("Building the trajectory")
+                trajectory = trajectory_pb2.WrenchTrajectory(points=[traj_point0, traj_point1])
+                
+                # Build the trajectory request, putting all axes into force mode
+                arm_cartesian_command = arm_command_pb2.ArmCartesianCommand.Request(
+                    root_frame_name=ODOM_FRAME_NAME, wrench_trajectory_in_task=trajectory,
+                    x_axis=arm_command_pb2.ArmCartesianCommand.Request.AXIS_MODE_FORCE,
+                    y_axis=arm_command_pb2.ArmCartesianCommand.Request.AXIS_MODE_FORCE,
+                    z_axis=arm_command_pb2.ArmCartesianCommand.Request.AXIS_MODE_FORCE,
+                    rx_axis=arm_command_pb2.ArmCartesianCommand.Request.AXIS_MODE_FORCE,
+                    ry_axis=arm_command_pb2.ArmCartesianCommand.Request.AXIS_MODE_FORCE,
+                    rz_axis=arm_command_pb2.ArmCartesianCommand.Request.AXIS_MODE_FORCE)
+                arm_command = arm_command_pb2.ArmCommand.Request(
+                    arm_cartesian_command=arm_cartesian_command)
+                synchronized_command = synchronized_command_pb2.SynchronizedCommand.Request(
+                    arm_command=arm_command)
+                robot_command = robot_command_pb2.RobotCommand(
+                    synchronized_command=synchronized_command)
+
+                # Send the request
+                self._robot_command_client.robot_command(robot_command)
+                self._logger.info('Force trajectory command sent')
+
+                time.sleep(10.0)
+
+        except Exception as e:
+            return False, "Exception occured during arm movement" + str(e)
+        
+    def gripper_open(self):
+        try:
+            success, msg = self.ensure_arm_power_and_stand()
+            if not success:
+                self._logger.info(msg)
+                return False, msg
+            else:
+                # Open gripper
+                command = RobotCommandBuilder.claw_gripper_open_command()
+
+                # Command issue with RobotCommandClient
+                self._robot_command_client.robot_command(command)
+                self._logger.info("Command gripper open sent")
+                time.sleep(2.0)
+
+        except Exception as e:
+            return False, "Exception occured while gripper was moving"
+
+        return True, "Open gripper success"
+
+    def gripper_close(self):
+        try:
+            success, msg = self.ensure_arm_power_and_stand()
+            if not success:
+                self._logger.info(msg)
+                return False, msg
+            else:
+                # Close gripper
+                command = RobotCommandBuilder.claw_gripper_close_command()
+
+                # Command issue with RobotCommandClient
+                self._robot_command_client.robot_command(command)
+                self._logger.info("Command gripper close sent")
+                time.sleep(2.0)
+                
+        except Exception as e:
+            return False, "Exception occured while gripper was moving"
+
+        return True, "Closed gripper successfully"
+    
+    
+    def gripper_angle_open(self, gripper_ang):
+        try:
+            success, msg = self.ensure_arm_power_and_stand()
+            if not success:
+                self._logger.info(msg)
+                return False, msg
+            else:
+                # Open gripper at an angle
+                command = RobotCommandBuilder.claw_gripper_open_angle_command(gripper_q)
+
+                # Command issue with RobotCommandClient
+                self._robot_command_client.robot_command(command)
+                self._logger.info("Command gripper open angle sent")
+                time.sleep(2.0)
+
+        except Exception as e:
+            return False, "Exception occured while gripper was moving"
+
+        return True, "Opened gripper successfully"
+    
+    def body_follow_arm(self):
+        try:
+            success, msg = self.ensure_arm_power_and_stand()
+            if not success:
+                self._logger.info(msg)
+                return False, msg
+            else:
+                # Move the arm to a spot in front of the robot, and command the body to follow the hand.
+                # Build a position to move the arm to (in meters, relative to the body frame origin.)
+                x = 1.25
+                y = 0
+                z = 0.25
+                hand_pos_rt_body = geometry_pb2.Vec3(x=x, y=y, z=z)
+
+                # Rotation as a quaternion.
+                qw = 1
+                qx = 0
+                qy = 0
+                qz = 0
+                body_Q_hand = geometry_pb2.Quaternion(w=qw, x=qx, y=qy, z=qz)
+
+                # Build the SE(3) pose of the desired hand position in the moving body frame.
+                body_T_hand = geometry_pb2.SE3Pose(position=hand_pos_rt_body, rotation=body_Q_hand)
+
+                # Transform the desired from the moving body frame to the odom frame.
+                robot_state = self._robot_state_client.get_robot_state()
+
+                odom_T_body = frame_helpers.get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
+                                            ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
+                odom_T_hand = odom_T_body * math_helpers.SE3Pose.from_obj(body_T_hand)
+
+                # duration in seconds
+                seconds = 5
+
+                # Create the arm command.
+                arm_command = RobotCommandBuilder.arm_pose_command(
+                    odom_T_hand.x, odom_T_hand.y, odom_T_hand.z, odom_T_hand.rot.w, odom_T_hand.rot.x,
+                    odom_T_hand.rot.y, odom_T_hand.rot.z, ODOM_FRAME_NAME, seconds)
+                self._logger.info("Create arm command")
+
+                # Tell the robot's body to follow the arm
+                follow_arm_command = RobotCommandBuilder.follow_arm_command()
+                
+                command = self._robot_command(RobotCommandBuilder.build_synchro_command(follow_arm_command, arm_command))
+                self._logger.info("After building command")
+
+                # Send the request
+                self._robot_command_client.robot_command(command)
+                robot.logger.info('Moving arm to position.')
+
+                time.sleep(6.0)
+
+        except Exception as e:
+            return False, "Exception occured while arm was moving"
+
+        return True, "Moved arm successfully"
+
+    def arm_pose_cmd(self, pose_x, pose_y, pose_z, q_x, q_y, q_z, q_w):
+        """Give a position for the arm to achieve"""
+        try:
+            success, msg = self.ensure_arm_power_and_stand()
+            if not success:
+                self._logger.info(msg)
+                return False, msg
+            else:
+                self.gripper_open()
+
+                # Position in meters to move arm (aligned to body frame)
+                position = geometry_pb2.Vec3(x=pose_x, y=pose_y, z=pose_z)
+                # Rotation as a quaternion
+                rotation = geometry_pb2.Quaternion(w=q_w, x=q_x, y=q_y, z=q_z)
+
+                flat_body_T_hand = geometry_pb2.SE3Pose(position=position,
+                                                        rotation=rotation)
+                
+                robot_state = self._robot_state_client.get_robot_state()
+                odom_T_body = get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
+                                                ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
+                odom_T_hand = odom_T_body * math_helpers.SE3Pose.from_obj(flat_body_T_hand)
+
+                end_time = 2
+                arm_command = RobotCommandBuilder.arm_pose_command(
+                    odom_T_hand.x, odom_T_hand.y, odom_T_hand.z, odom_T_hand.rot.w,
+                    odom_T_hand.rot.x, odom_T_hand.rot.y, odom_T_hand.rot.z,
+                    ODOM_FRAME_NAME, end_time
+                )
+
+                command = RobotCommandBuilder.build_synchro_command(arm_command)
+                cmd_id = self._robot_command(command)
+                
+        except Exception as e:
+            return False, "Exception occured while arm was moving"
+
+        return True
+
+    
+    def hand_pose(self, pose_points):
+        """By giving a position and orientation in space to the gripper, the arm will move to achieve it """
+        try:
+            success, msg = self.ensure_arm_power_and_stand()
+            if not success:
+                self._logger.info(msg)
+                return False, msg
+            else:
+                # Move the arm to a spot in front of the robot given a pose for the gripper.
+                # Build a position to move the arm to (in meters, relative to the body frame origin.)
+                x = pose_points[0] #1.45
+                y = pose_points[1] #0.2
+                z = pose_points[2] #0.85
+                position = geometry_pb2.Vec3(x=x, y=y, z=z)
+
+                # Rotation as a quaternion.
+                qw = pose_points[3]
+                qx = pose_points[4]
+                qy = pose_points[5]
+                qz = pose_points[6]
+                rotation = geometry_pb2.Quaternion(w=qw, x=qx, y=qy, z=qz)
+
+                seconds = 5.0
+                duration = seconds_to_duration(seconds)
+
+                # Build the SE(3) pose of the desired hand position in the moving body frame.
+                hand_pose = geometry_pb2.SE3Pose(position=position, rotation=rotation)
+                hand_pose_traj_point = trajectory_pb2.SE3TrajectoryPoint(pose=hand_pose, time_since_reference=duration)                
+                hand_trajectory = trajectory_pb2.SE3Trajectory(points=[hand_pose_traj_point])
+                
+                arm_cartesian_command = arm_command_pb2.ArmCartesianCommand.Request(
+                    root_frame_name=ODOM_FRAME_NAME, pose_trajectory_in_task=hand_trajectory)
+                arm_command = arm_command_pb2.ArmCommand.Request(
+                    arm_cartesian_command=arm_cartesian_command)
+                synchronized_command = synchronized_command_pb2.SynchronizedCommand.Request(
+                    arm_command=arm_command)
+                                
+                #robot_command = self._robot_command(RobotCommandBuilder.build_synchro_command(synchronized_command))
+                robot_command = robot_command_pb2.RobotCommand(synchronized_command=synchronized_command)
+
+                command = self._robot_command(RobotCommandBuilder.build_synchro_command(robot_command))
+
+                self._logger.info("After building command")
+
+                # Send the request
+                self._robot_command_client.robot_command(command)
+                self._logger.info('Moving arm to position.')
+
+                time.sleep(6.0)
+
+        except Exception as e:
+            return False, "Exception occured while arm was moving"
+
+        return True, "Moved arm successfully"
+
+
+    def grasp_object_image(self, y_min, x_min, y_max, x_max):
+        print("Starting grasp object in image")
+        try:
+            success, msg = self.ensure_arm_power_and_stand()
+            self.gripper_open()
+            self.arm_unstow()
+            if not success:
+                self._logger.info(msg)
+                return False, msg
+            else:
+                manipulation_api_client = self._robot.ensure_client(ManipulationApiClient.default_service_name)
+
+                visual_image = self._image_client.get_image_from_sources(["hand_image"])[0]
+                print("visual_image being used: " + str(visual_image))
+                
+                # Find centre pixel of the rotated bounding box in the original frame
+                center_px_x = math.fabs(x_max - x_min) / 2.0 + x_min
+                center_px_y = math.fabs(y_max - y_min) / 2.0 + y_min
+                # Request Pick up on that pixel
+                pick_vec = geometry_pb2.Vec2(x=center_px_x, y=center_px_y)
+                grasp = manipulation_api_pb2.PickObjectInImage(
+                    pixel_xy=pick_vec,
+                    transforms_snapshot_for_camera=visual_image.shot.transforms_snapshot,
+                    frame_name_image_sensor=visual_image.shot.frame_name_image_sensor,
+                    camera_model=visual_image.source.pinhole,
+                    walk_gaze_mode=False)
+
+                print("grasp is " + str(grasp))
+
+                # We can specify where in the gripper we want to grasp. About halfway is generally good for
+                # small objects like this. For a bigger object like a shoe, 0 is better (use the entire
+                # gripper)
+                grasp.grasp_params.grasp_palm_to_fingertip = 0.6
+
+                # Tell the grasping system that we want a top-down grasp.
+
+                # Add a constraint that requests that the x-axis of the gripper is pointing in the
+                # negative-z direction in the vision frame.
+
+                # The axis on the gripper is the x-axis.
+                axis_on_gripper_ewrt_gripper = geometry_pb2.Vec3(x=1, y=0, z=0)
+
+                # The axis in the vision frame is the negative z-axis
+                axis_to_align_with_ewrt_vision = geometry_pb2.Vec3(x=0, y=0, z=-1)
+
+                # Add the vector constraint to our proto.
+                constraint = grasp.grasp_params.allowable_orientation.add()
+                constraint.vector_alignment_with_tolerance.axis_on_gripper_ewrt_gripper.CopyFrom(
+                    axis_on_gripper_ewrt_gripper)
+                constraint.vector_alignment_with_tolerance.axis_to_align_with_ewrt_frame.CopyFrom(
+                    axis_to_align_with_ewrt_vision)
+
+                # We'll take anything within about 15 degrees for top-down or horizontal grasps.
+                constraint.vector_alignment_with_tolerance.threshold_radians = 0.25
+
+                # Specify the frame we're using.
+                grasp.grasp_params.grasp_params_frame_name = frame_helpers.VISION_FRAME_NAME
+
+                # Build the proto
+                grasp_request = manipulation_api_pb2.ManipulationApiRequest(
+                    pick_object_in_image=grasp)
+
+                # Send the request
+                print('Sending grasp request...')
+                cmd_response = manipulation_api_client.manipulation_api_command(
+                    manipulation_api_request=grasp_request)
+
+                # Wait for the grasp to finish
+                grasp_done = False
+                failed = False
+                time_start = time.time()
+                timeout_sec = 8
+                end_time = time_start + timeout_sec
+                now = time.time()
+
+                while now < end_time or not grasp_done:
+                    feedback_request = manipulation_api_pb2.ManipulationApiFeedbackRequest(
+                        manipulation_cmd_id=cmd_response.manipulation_cmd_id)
+
+                    # Send a request for feedback
+                    response = manipulation_api_client.manipulation_api_feedback_command(
+                        manipulation_api_feedback_request=feedback_request)
+
+                    current_state = response.current_state
+                    current_time = time.time()
+                    print('Current state ({time:.1f} sec): {state}'.format(
+                        time=current_time - time_start,
+                        state=manipulation_api_pb2.ManipulationFeedbackState.Name(
+                            current_state)),
+                        end='                \r')
+                    #sys.stdout.flush()
+
+                    failed_states = [manipulation_api_pb2.MANIP_STATE_GRASP_FAILED,
+                                    manipulation_api_pb2.MANIP_STATE_GRASP_PLANNING_NO_SOLUTION,
+                                    manipulation_api_pb2.MANIP_STATE_GRASP_FAILED_TO_RAYCAST_INTO_MAP,
+                                    manipulation_api_pb2.MANIP_STATE_GRASP_PLANNING_WAITING_DATA_AT_EDGE]
+
+                    failed = current_state in failed_states
+                    grasp_done = current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED or failed
+
+                    time.sleep(0.1)
+                    now = time.time()
+                    
+        finally:
+            print("grasp done")
+
+    
+    def walk_to_object_image(self, object_point):
+        print("In wrapper")
+        print(object_point)
+
+        try:
+            success, msg = self.ensure_arm_power_and_stand()
+            self.gripper_open()
+            if not success:
+                self._logger.info(msg)
+                return False, msg
+            else:
+                walk_vec = geometry_pb2.Vec2(x=object_point[0], y=object_point[1])
+
+                manipulation_api_client = self._robot.ensure_client(ManipulationApiClient.default_service_name)
+                print("manipulation_api_client")
+
+                data = self.front_images
+                image_used = data[1]
+
+                offset_distance = None
+
+                # Build proto
+                walk_to = manipulation_api_pb2.WalkToObjectInImage(
+                    pixel_xy=walk_vec, transforms_snapshot_for_camera=image_used.shot.transforms_snapshot,
+                    frame_name_image_sensor=image_used.shot.frame_name_image_sensor,
+                    camera_model=image_used.source.pinhole, offset_distance=offset_distance)
+
+                print("Built proto")
+
+                # Ask Spot to pick up the object
+                walk_to_request = manipulation_api_pb2.ManipulationApiRequest(
+                    walk_to_object_in_image=walk_to)
+
+                print("Walk to request")
+
+                # Send the request
+                cmd_response = manipulation_api_client.manipulation_api_command( 
+                    manipulation_api_request=walk_to_request)
+
+                print("Sent request")
+
+                # Get feedback from robot
+                while True:
+                    time.sleep(0.25)
+                    feedback_request = manipulation_api_pb2.ManipulationApiFeedbackRequest(
+                        manipulation_cmd_id=cmd_response.manipulation_cmd_id)
+
+                    print("Feedback request")
+
+                    # Send the request
+                    response = manipulation_api_client.manipulation_api_feedback_command(
+                        manipulation_api_feedback_request=feedback_request)
+
+                    print("Feedback response")
+
+                    print('Current state: ', manipulation_api_pb2.ManipulationFeedbackState.Name(response.current_state))
+
+                    if response.current_state == manipulation_api_pb2.MANIP_STATE_DONE:
+                        break
+
+                self._logger.info('Finished')
+                time.sleep(4.0)
+
+        finally:
+            print("done")
+
+    # BEGIN: METHODS FOR FETCH ############################################################################
+    def block_for_trajectory_cmd(self, cmd_id, timeout_sec=None):
+        """Helper that blocks until a trajectory command reaches STATUS_AT_GOAL or a timeout is
+            exceeded.
+        Args:
+            cmd_id: command ID returned by the robot when the trajectory command was sent
+            timeout_sec: optional number of seconds after which we'll return no matter what the
+                            robot's state is.
+        Return values:
+            True if reaches STATUS_AT_GOAL, False otherwise.
+        """
+        start_time = time.time()
+        verbose = True
+
+        if timeout_sec is not None:
+            end_time = start_time + timeout_sec
+            now = time.time()
+
+        while timeout_sec is None or now < end_time:
+            feedback_resp = self._robot_command_client.robot_command_feedback(cmd_id)
+            current_state = feedback_resp.feedback.synchronized_feedback.mobility_command_feedback.se2_trajectory_feedback.status
+            print('current_state ' + str(current_state))
+
+            if verbose:
+                current_state_str = basic_command_pb2.SE2TrajectoryCommand.Feedback.Status.Name(current_state)
+
+                current_time = time.time()
+                print('Walking: ({time:.1f} sec): {state}'.format(
+                    time=current_time - start_time, state=current_state_str),
+                    end='                \r')
+
+            if current_state == basic_command_pb2.SE2TrajectoryCommand.Feedback.STATUS_AT_GOAL:
+                return True
+
+            time.sleep(0.3)
+            now = time.time()
+
+        if verbose:
+            print('block_for_trajectory_cmd: timeout exceeded.')
+
+        return False
+    
+    
+    def _get_heading(self, xhat):
+        """ Get heading direction"""
+        zhat = [0.0, 0.0, 1.0]
+        yhat = np.cross(zhat, xhat)
+        mat = np.array([xhat, yhat, zhat]).transpose()
+        return math_helpers.Quat.from_matrix(mat).to_yaw()
+    
+    
+    def get_go_to(self, world_tform_object, mobility_params, dist_margin=0.5):
+        """Gets trajectory command to a goal location
+
+        Args:
+            world_tform_object (SE3Pose): Transform from vision frame to target object
+            robot_state (RobotState): Current robot state
+            mobility_params (MobilityParams): Mobility parameters
+            dist_margin (float): Distance margin to target
+        """
+        robot_state = self._robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
+        vo_tform_robot = frame_helpers.get_vision_tform_body(robot_state)
+
+        delta_ewrt_vo = np.array(
+            [world_tform_object.x - vo_tform_robot.x, world_tform_object.y - vo_tform_robot.y, 0])
+        norm = np.linalg.norm(delta_ewrt_vo)
+        if norm == 0:
+            return None
+        delta_ewrt_vo_norm = delta_ewrt_vo / norm
+        heading = self._get_heading(delta_ewrt_vo_norm)
+        vo_tform_goal = np.array([
+            world_tform_object.x - delta_ewrt_vo_norm[0] * dist_margin,
+            world_tform_object.y - delta_ewrt_vo_norm[1] * dist_margin
+        ])
+
+        position = geometry_pb2.Vec2(x=vo_tform_goal[0], y=vo_tform_goal[1])
+        goal_se2 = geometry_pb2.SE2Pose(position=position, angle=heading)
+        tag_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(
+                                goal_se2=goal_se2,
+                                frame_name=frame_helpers.VISION_FRAME_NAME,
+                                params=mobility_params)
+
+        """
+        There are many move command posiible in the SDK apart from synchro_se2_trajectory_command.
+        Below are two other examples that could be used instead:
+
+        tag_cmd = RobotCommandBuilder.synchro_se2_trajectory_point_command(
+                                goal_x=vo_tform_goal[0],
+                                goal_y=vo_tform_goal[1],
+                                goal_heading=heading,
+                                frame_name=frame_helpers.VISION_FRAME_NAME,
+                                params=mobility_params)
+
+        tag_cmd = RobotCommandBuilder.trajectory_command(goal_x=vo_tform_goal[0],
+                                                        goal_y=vo_tform_goal[1], goal_heading=heading,
+                                                        frame_name=frame_helpers.VISION_FRAME_NAME,
+                                                        params=mobility_params)
+        """
+        return tag_cmd
+    
+    
+    
+    def get_distance_to_closest_object_depth(self, x_min, x_max, y_min, y_max, depth_scale, raw_depth_image,
+                                         histogram_bin_size=0.20, minimum_number_of_points=100,
+                                         max_distance=4.0):
+        """Make a histogram of distances to points in the cloud and take the closest distance with
+        enough points.
+
+        Args:
+            origin (tuple): Origin to rotate the point around
+            x_min (int): minimum x coordinate (column) of object to find
+            x_max (int): maximum x coordinate (column) of object to find
+            y_min (int): minimum y coordinate (row) of object to find
+            y_max (int): maximum y coordinate (row) of object to find
+            depth_scale (float): depth scale of the image to convert from sensor value to meters
+            raw_depth_image (np.array): matrix of depth pixels
+            histogram_bin_size (float): size of each bin of distances
+            minimum_number_of_points (int): minimum number of points before returning depth
+            max_distance (float): maximum distance to object in meters
+
+        Default:
+            histogram_bin_size=0.20
+            minimum_number_of_points=100
+            max_distance=4.0
+        """'frontright_depth_in_visual_frame'
+        print("In get_distance_to_closest_object_depth")
+        num_bins = math.ceil(max_distance / histogram_bin_size)
+        depths = []
+
+        for row in range(y_min, y_max):
+            for col in range(x_min, x_max):
+                raw_depth = raw_depth_image[row][col]
+                if raw_depth != 0 and raw_depth is not None:
+                    depth = raw_depth / depth_scale
+                    depths.append(depth)
+
+        hist, hist_edges = np.histogram(depths, bins=num_bins, range=(0, max_distance))
+
+        edges_zipped = zip(hist_edges[:-1], hist_edges[1:])
+        # Iterate over the histogram and return the first distance with enough points.
+        for entry, edges in zip(hist, edges_zipped):
+            if entry > minimum_number_of_points:
+                return statistics.mean([d for d in depths if d > edges[0] and d > edges[1]])
+
+        return max_distance
+
+    def rotate_about_origin_degrees(self, origin, point, angle):
+        """
+        Rotate a point counterclockwise by a given angle around a given origin.
+
+        Args:
+            origin (tuple): Origin to roFutureWrappertate the point around
+            point (tuple): Point to rotate
+            angle (float): Angle in degrees
+        """
+        return self.rotate_about_origin(origin, point, math.radians(angle))
+
+    def rotate_about_origin(self, origin, point, angle):
+        """
+        Rotate a point counterclockwise by a given angle around a given origin.
+
+        Args:
+            origin (tuple): Origin to rotate the point around
+            point (tuple): Point to rotate
+            angle (float): Angle in radians
+        """
+        orig_x, orig_y = origin
+        pnt_x, pnt_y = point
+
+        ret_x = orig_x + math.cos(angle) * (pnt_x - orig_x) - math.sin(angle) * (pnt_y - orig_y)
+        ret_y = orig_y + math.sin(angle) * (pnt_x - orig_x) + math.cos(angle) * (pnt_y - orig_y)
+        return int(ret_x), int(ret_y)
+    
+    
+    def get_object_position(self, world_tfrom_cam, visual_image, depth_image, y_min, y_max, x_min, x_max):
+        """
+        Function to get the object to be grasped position uing visual and depth data
+        world_tform_cam (SE3Pose): SE3 transform from world to camera frame
+        visual_image (ImageResponse): From a visual camera
+        depth_image (ImageResponse): From a depth camera corresponding to the visual_image
+        """
+        if visual_image is None or depth_image is None:
+            print("Fail: Visual or depth image is none")
+            return
+
+        print("world_tfrom_cam is " + str(world_tfrom_cam) + " type " + str(type(world_tfrom_cam)))
+
+        # Get width and height of bounding box
+        height = y_max - y_min
+        width = x_max - x_min
+        print("height of bouding box is " + str(height) + " width is " + str(width))
+
+        # Rotate bounding box back to original frame
+        rotation_angle = -102 # FOR FRONTRIGHT_FISHEYE_IMAGE
+        points = [(y_min, x_min), (height, x_min), (height, width), (y_min, width)]
+        origin = (visual_image.shot.image.cols / 2, visual_image.shot.image.rows / 2)
+        points_rot = [self.rotate_about_origin_degrees(origin, point, rotation_angle) for point in points]
+
+        # Get bounding box corners in right frame
+        ymin = max(0, min([point[1] for point in points_rot]))
+        xmin = max(0, min([point[0] for point in points_rot]))
+        ymax = min(visual_image.shot.image.rows, max([point[1] for point in points_rot]))
+        xmax = min(visual_image.shot.image.cols, max([point[0] for point in points_rot]))
+
+        print("new points: ymin, " + str(ymin) + " xmin " + str(xmin) + " ymax " + str(ymax) + " xmax " + str(xmax))
+        
+        # Check that the bounding box is valid
+        if (xmin < 0 or ymin < 0 or xmax > visual_image.shot.image.cols or
+                ymax > visual_image.shot.image.rows):
+            print(f'Bounding box is invalid: ({xmin}, {ymin}) | ({xmax}, {ymax})')
+            print(f'Bounds: ({visual_image.shot.image.cols}, {visual_image.shot.image.rows})')
+            return
+        
+        try:
+            if depth_image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
+                dtype = np.uint16
+            else:
+                dtype = np.uint8
+            img = np.fromstring(depth_image.shot.image.data, dtype = dtype)
+            if depth_image.shot.image.format == image_pb2.Image.FORMAT_RAW:
+                img = img.reshape(depth_image.shot.image.rows, depth_image.shot.image.cols)
+            else:
+                img = cv2.imdecode(img, -1)
+            
+            depth_image_pixels = img
+
+            # Get depth data from the region in the bounding box
+            depth = self.get_distance_to_closest_object_depth(xmin, xmax, ymin, ymax,
+                                                     depth_image.source.depth_scale,
+                                                     depth_image_pixels)
+
+            print("depth is " + str(depth))
+
+            if depth >= 4.0:
+                print("Not enough depth data")
+                return False
+            
+            # Calculate the transform to the center point of the object using camera intrinsics
+            # and depth calculated earlier in the function
+            focal_x = depth_image.source.pinhole.intrinsics.focal_length.x
+            principal_x = depth_image.source.pinhole.intrinsics.principal_point.x
+
+            focal_y = depth_image.source.pinhole.intrinsics.focal_length.y
+            principal_y = depth_image.source.pinhole.intrinsics.principal_point.y
+
+            center_x = round((xmax - xmin) / 2.0 + xmin)
+            center_y = round((ymax - ymin) / 2.0 + ymin)
+
+            tform_x = depth * (center_x - principal_x) / focal_x
+            tform_y = depth * (center_y - principal_y) / focal_y
+            tform_z = depth
+            obj_tform_camera = math_helpers.SE3Pose(tform_x, tform_y, tform_z, math_helpers.Quat())
+
+            return world_tfrom_cam * obj_tform_camera
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f'Error getting object position: {exc}')
+            return
+
+    def get_world_tfrom_object(self):
+        """Helper to return world_tfrom_object detected"""
+        if self._get_world_tfrom_object is not None:
+            return self._get_world_tfrom_object
+    
+    def fetch_obj(self, center_px, y_min, x_min, y_max, x_max):
+        """Fetch function to get the distance from the object to be grasped to the robot, and walk to it"""
+        try:
+            success, msg = self.ensure_arm_power_and_stand()
+            self.gripper_open()
+            if not success:
+                self._logger.info(msg)
+                return False, msg
+            else:
+                data = self.front_images
+                
+                image_used = data[1]   # image
+                print("image_used type " + str(type(image_used)))
+                # Needing this depth ImageResponse so size is the same than visual frame
+                depth_used = self._image_client.get_image_from_sources(["frontright_depth_in_visual_frame"])[0]
+                print("depth_used type " + str(type(depth_used)))
+
+                # Get a tf from vision to sensor/camera
+                vision_tfrom_cam = frame_helpers.get_a_tform_b(
+                    image_used.shot.transforms_snapshot,
+                    frame_helpers.VISION_FRAME_NAME,
+                    image_used.shot.frame_name_image_sensor
+                )
+
+                if vision_tfrom_cam is None:
+                    print("vision_tfrom_cam is NONE")
+                else:
+                    print("vision_tfrom_cam is " + str(vision_tfrom_cam) + " and type is " + str(type(vision_tfrom_cam)))
+
+                    # Find transform to object using depth sensor
+                    world_tfrom_object = self.get_object_position(
+                        world_tfrom_cam=vision_tfrom_cam,
+                        visual_image=image_used,
+                        depth_image=depth_used,
+                        y_min=y_min, y_max=y_max, x_min=x_min, x_max=x_max
+                    )
+
+                    if world_tfrom_object is False:
+                        return False
+
+                    # Create a TF from the object detected to the robot
+                    self._get_world_tfrom_object = world_tfrom_object
+                    print("world_tfrom_object " + str(world_tfrom_object) + " type " + str(type(world_tfrom_object)))
+
+                    # Create move command
+                    params_set = self._mobility_params
+
+                    # Get trajectory tag command
+                    move_cmd = self.get_go_to(world_tform_object=world_tfrom_object,
+                                            mobility_params=params_set,
+                                            dist_margin=0.5)
+                    print("move_cmd " + str(move_cmd) + " type is " + str(type(move_cmd)))
+
+                    end_time = time.time() + 15.0
+                    if move_cmd is not None:
+                        # Move to the detected object
+                        cmd_id = self._robot_command_client.robot_command(
+                            command=move_cmd, end_time_secs=end_time
+                            )
+                        self.block_for_trajectory_cmd(cmd_id=cmd_id, timeout_sec=15)
+                        
+        except Exception as exc:
+            print(f'Error while doing fetch: {exc}')
+            return
+    # END: METHODS FOR FETCH ############################################################################
+            
+
+    ###################################################################
 
     ## copy from spot-sdk/python/examples/graph_nav_command_line/graph_nav_command_line.py
     def _get_localization_state(self, *args):

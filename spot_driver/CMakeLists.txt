@@ -5,7 +5,12 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
 )
 
-catkin_package()
+catkin_package(
+#  INCLUDE_DIRS include
+#  LIBRARIES my_grasping
+#  CATKIN_DEPENDS cv2 cv_bridge geometry_msgs roscpp rospy std_msgs
+#  DEPENDS system_lib
+)
 
 catkin_python_setup()
 
